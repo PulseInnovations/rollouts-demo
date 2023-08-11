@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -24,7 +26,7 @@ const (
 	// the Pod IP being removed from the Service's Endpoint list, which prevents traffic from being
 	// directed to terminated pods, which otherwise would cause timeout errors and/or request delays.
 	// See: https://github.com/kubernetes/ingress-nginx/issues/3335#issuecomment-434970950
-	defaultTerminationDelay = 10
+	defaultTerminationDelay = 2
 )
 
 var (
@@ -38,7 +40,7 @@ var (
 		"purple",
 	}
 	envLatency   float64
-	envErrorRate int
+	envErrorRate float64
 )
 
 func init() {
@@ -52,9 +54,12 @@ func init() {
 	}
 	envErrorRateStr := os.Getenv("ERROR_RATE")
 	if envErrorRateStr != "" {
-		envErrorRate, err = strconv.Atoi(envErrorRateStr)
+		envErrorRate, err = strconv.ParseFloat(envErrorRateStr, 64)
 		if err != nil {
 			panic(fmt.Sprintf("failed to parse ERROR_RATE: %s", envErrorRateStr))
+		}
+		if envErrorRate > 1.0 || envErrorRate < 0.0 {
+			panic(fmt.Sprintf("invalid ERROR_RATE must be between : 0.0 and 1.0 (%s was specified)", envLatencyStr))
 		}
 	}
 }
@@ -75,6 +80,12 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	router := http.NewServeMux()
+	metricsRouter := http.NewServeMux()
+
+	metricsRouter.Handle("/metrics", promhttp.Handler())
+
+	metricsServer := &http.Server{Addr: ":8081", Handler: metricsRouter}
+
 	router.Handle("/", http.StripPrefix("/", http.FileServer(http.Dir("./"))))
 	router.HandleFunc("/color", getColor)
 
@@ -82,6 +93,7 @@ func main() {
 		Addr:    listenAddr,
 		Handler: router,
 	}
+
 	if tls {
 		tlsConfig, err := CreateServerTLSConfig("", "", []string{"localhost", "rollouts-demo"})
 		if err != nil {
@@ -108,15 +120,27 @@ func main() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+
 		if err := server.Shutdown(ctx); err != nil {
 			log.Fatalf("Could not gracefully shutdown the server: %v\n", err)
 		}
+
 		close(done)
 	}()
 
 	cpuBurn(done, numCPUBurn)
-	log.Printf("Started server on %s", listenAddr)
 	var err error
+
+	go func() {
+		log.Printf("Started metrics server on :8081")
+		err := metricsServer.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Could not listen on %s: %v\n", listenAddr, err)
+		}
+	}()
+
+	log.Printf("Started server on %s", listenAddr)
+
 	if tls {
 		err = server.ListenAndServeTLS("", "")
 	} else {
@@ -184,7 +208,7 @@ func getColor(w http.ResponseWriter, r *http.Request) {
 	statusCode := http.StatusOK
 	if colorParams.Return500Probability != nil && *colorParams.Return500Probability > 0 && *colorParams.Return500Probability >= rand.Intn(100) {
 		statusCode = http.StatusInternalServerError
-	} else if envErrorRate > 0 && rand.Intn(100) >= envErrorRate {
+	} else if envErrorRate > 0 && envErrorRate >= rand.Float64() {
 		statusCode = http.StatusInternalServerError
 	}
 	printColor(colorToReturn, w, statusCode)
